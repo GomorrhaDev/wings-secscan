@@ -1152,7 +1152,7 @@ impl BackupExt for ResticBackup {
                         let header = entry.header().clone();
                         let relative = entry.path()?;
 
-                        let mut options: zip::write::FileOptions<'_, ()> =
+                        let mut options: zip::write::FileOptions<'_, '_, ()> =
                             zip::write::FileOptions::default()
                                 .compression_level(
                                     Some(compression_level.to_deflate_level() as i64),
@@ -2429,7 +2429,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                             continue;
                         }
 
-                        let mut options: zip::write::FileOptions<'_, ()> =
+                        let mut options: zip::write::FileOptions<'_, '_, ()> =
                             zip::write::FileOptions::default()
                                 .compression_level(
                                     Some(compression_level.to_deflate_level() as i64),
@@ -2799,7 +2799,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                         continue;
                                     }
 
-                                    let mut options: zip::write::FileOptions<'_, ()> =
+                                    let mut options: zip::write::FileOptions<'_, '_, ()> =
                                         zip::write::FileOptions::default()
                                             .compression_level(Some(
                                                 compression_level.to_deflate_level() as i64,
@@ -2854,7 +2854,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                             } => {
                                 let mut child = spawn_restic(false, &entry_path)?;
 
-                                let options: zip::write::FileOptions<'_, ()> =
+                                let options: zip::write::FileOptions<'_, '_, ()> =
                                     zip::write::FileOptions::default()
                                         .compression_level(Some(
                                             compression_level.to_deflate_level() as i64,
