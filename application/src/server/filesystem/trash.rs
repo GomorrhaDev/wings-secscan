@@ -9,9 +9,10 @@ use tokio::sync::RwLock;
 use utoipa::ToSchema;
 
 pub const TRASH_DIRECTORY: &str = ".trash";
+pub const PURGE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(5);
+
 const META_FILE: &str = "meta.json";
 const META_SIZE_CAP: usize = 64 * 1024;
-pub const PURGE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(5);
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -77,11 +78,11 @@ pub fn ignore_line() -> String {
     format!("/{TRASH_DIRECTORY}")
 }
 
-pub fn entry_directory(uuid: uuid::Uuid) -> PathBuf {
+fn entry_directory(uuid: uuid::Uuid) -> PathBuf {
     Path::new(TRASH_DIRECTORY).join(uuid.to_string())
 }
 
-pub fn payload_path(uuid: uuid::Uuid, name: &str) -> PathBuf {
+fn payload_path(uuid: uuid::Uuid, name: &str) -> PathBuf {
     entry_directory(uuid).join(name)
 }
 
@@ -90,7 +91,7 @@ pub struct TrashManager {
     entries: RwLock<HashMap<uuid::Uuid, TrashMeta>>,
     retention: AtomicU64,
     usage_threshold: AtomicU64,
-    purge_task: parking_lot::Mutex<Option<tokio::task::AbortHandle>>,
+    purge_task: std::sync::OnceLock<tokio::task::AbortHandle>,
 }
 
 impl TrashManager {
@@ -105,13 +106,13 @@ impl TrashManager {
     }
 
     #[inline]
-    pub fn set_retention(&self, retention: Option<u64>) {
+    fn set_retention(&self, retention: Option<u64>) {
         self.retention
             .store(retention.unwrap_or(0), Ordering::Relaxed);
     }
 
     #[inline]
-    pub fn retention(&self) -> Option<u64> {
+    fn retention(&self) -> Option<u64> {
         match self.retention.load(Ordering::Relaxed) {
             0 => None,
             retention => Some(retention),
@@ -124,24 +125,24 @@ impl TrashManager {
     }
 
     #[inline]
-    pub fn set_usage_threshold(&self, threshold: Option<u64>) {
+    fn set_usage_threshold(&self, threshold: Option<u64>) {
         self.usage_threshold
             .store(threshold.unwrap_or(0), Ordering::Relaxed);
     }
 
     #[inline]
-    pub fn usage_threshold(&self) -> Option<u64> {
+    fn usage_threshold(&self) -> Option<u64> {
         match self.usage_threshold.load(Ordering::Relaxed) {
             0 => None,
             threshold => Some(threshold),
         }
     }
 
-    pub async fn is_empty(&self) -> bool {
+    async fn is_empty(&self) -> bool {
         self.entries.read().await.is_empty()
     }
 
-    pub async fn get(&self, uuid: uuid::Uuid) -> Option<TrashMeta> {
+    async fn get(&self, uuid: uuid::Uuid) -> Option<TrashMeta> {
         self.entries.read().await.get(&uuid).cloned()
     }
 
@@ -162,7 +163,7 @@ impl TrashManager {
         Some(meta)
     }
 
-    pub async fn entries(&self) -> Vec<(uuid::Uuid, TrashMeta)> {
+    async fn entries(&self) -> Vec<(uuid::Uuid, TrashMeta)> {
         let mut entries: Vec<_> = self
             .entries
             .read()
@@ -296,21 +297,19 @@ impl TrashManager {
         let file_type: FileType = metadata.file_type().into();
 
         let size = if file_type.is_dir() {
-            let disk_usage = filesystem.disk_usage.read().await;
-
-            match disk_usage.get_size(&path) {
-                Some(space) => Some(space),
-                None => match filesystem.async_canonicalize(&path).await {
-                    Ok(canonical) => disk_usage.get_size(&canonical),
-                    Err(_) => None,
-                },
-            }
-            .map_or(metadata.len(), |space| space.get_logical())
+            filesystem
+                .directory_entry_space(&path, super::DirectoryEntryOptions::server_fs(true))
+                .await
+                .0
         } else {
             metadata.len()
         };
 
-        let from_key = filesystem.diff_key(&path).await;
+        let from_key = if file_type.is_file() {
+            Some(filesystem.diff_key(&path).await)
+        } else {
+            None
+        };
 
         let uuid = uuid::Uuid::new_v4();
         let entry_directory = entry_directory(uuid);
@@ -369,13 +368,14 @@ impl TrashManager {
             return Err(err);
         }
 
-        if let Err(err) = server
-            .diff
-            .rename_file(
-                &from_key.to_string_lossy(),
-                &payload_path(uuid, &name).to_string_lossy(),
-            )
-            .await
+        if let Some(from_key) = from_key
+            && let Err(err) = server
+                .diff
+                .rename_file(
+                    &from_key.to_string_lossy(),
+                    &payload_path(uuid, &name).to_string_lossy(),
+                )
+                .await
         {
             tracing::error!("failed to rename file in diff storage: {:?}", err);
         }
@@ -459,7 +459,7 @@ impl TrashManager {
         Ok(RestoreOutcome::Restored(entry))
     }
 
-    pub async fn purge(
+    async fn purge(
         &self,
         server: &crate::server::Server,
         uuid: uuid::Uuid,
@@ -548,7 +548,7 @@ impl TrashManager {
         }
     }
 
-    pub async fn purge_expired(&self, server: &crate::server::Server) -> usize {
+    async fn purge_expired(&self, server: &crate::server::Server) -> usize {
         let Some(retention) = self.retention() else {
             return 0;
         };
@@ -575,7 +575,7 @@ impl TrashManager {
         (usage as u128) * 100 >= (limit as u128) * (threshold as u128)
     }
 
-    pub async fn purge_over_threshold(&self, server: &crate::server::Server) -> usize {
+    async fn purge_over_threshold(&self, server: &crate::server::Server) -> usize {
         if !self.over_usage_threshold(server).await {
             return 0;
         }
@@ -616,6 +616,10 @@ impl TrashManager {
     pub async fn ensure_not_full(&self, server: &crate::server::Server) -> bool {
         let mut purged = 0;
         if server.filesystem.is_full().await {
+            if self.is_empty().await {
+                return false;
+            }
+
             purged += self.purge_oldest_while(server, PurgeUntil::NotFull).await;
         }
 
@@ -647,11 +651,11 @@ impl TrashManager {
     }
 
     pub fn set_purge_task(&self, task: tokio::task::AbortHandle) {
-        *self.purge_task.lock() = Some(task);
+        let _ = self.purge_task.set(task);
     }
 
     pub fn abort_purge_task(&self) {
-        if let Some(task) = self.purge_task.lock().take() {
+        if let Some(task) = self.purge_task.get() {
             task.abort();
         }
     }
@@ -991,6 +995,7 @@ mod tests {
         });
     }
 
+    // Filesystem
     #[test]
     fn trash_directory_is_denied_and_hidden() {
         Server::with_mock(|server| async move {

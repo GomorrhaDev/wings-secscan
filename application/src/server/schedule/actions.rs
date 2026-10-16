@@ -1536,22 +1536,17 @@ impl ScheduleAction {
                         Err(_) => continue,
                     };
 
-                    let result = if trash {
-                        if !filesystem.is_primary_server_fs() {
-                            return Err(format!(
-                                "cannot trash `{file}`: not on the server filesystem"
-                            )
-                            .into());
+                    let result = if filesystem.is_primary_server_fs() {
+                        if trash {
+                            server
+                                .filesystem
+                                .trash
+                                .trash(server, &source, TrashSource::Schedule)
+                                .await
+                                .map(drop)
+                        } else {
+                            server.filesystem.truncate_path(&source).await
                         }
-
-                        server
-                            .filesystem
-                            .trash
-                            .trash(server, &source, TrashSource::Schedule)
-                            .await
-                            .map(drop)
-                    } else if filesystem.is_primary_server_fs() {
-                        server.filesystem.truncate_path(&source).await
                     } else if metadata.file_type.is_dir() {
                         filesystem.async_remove_dir_all(&source).await
                     } else {

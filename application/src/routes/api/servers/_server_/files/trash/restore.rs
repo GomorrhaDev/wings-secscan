@@ -71,7 +71,7 @@ mod post {
             };
 
             let target = match path {
-                Some(path) => server.filesystem.relative_path(Path::new(path.as_str())),
+                Some(path) => server.filesystem.relative_path(Path::new(&path)),
                 None => PathBuf::from(meta.path.as_str()),
             };
 

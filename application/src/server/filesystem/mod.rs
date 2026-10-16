@@ -435,7 +435,6 @@ impl Filesystem {
         gateways.iter().any(|gateway| gateway.starts_with(&*path))
     }
 
-    /// The virtual backup browsing directory and everything beneath it.
     fn is_backups_virtual(&self, path: &Path) -> bool {
         let config = self.config.load();
         if !config.system.backups.mounting.enabled {
@@ -469,18 +468,10 @@ impl Filesystem {
             return false;
         }
 
-        let resolved = match self.async_canonicalize(path).await {
-            Ok(resolved) => resolved,
-            Err(_) => match path.file_name() {
-                Some(name) => self.async_canonicalize_parent(path).await.join(name),
-                None => return false,
-            },
-        };
-
-        self.is_mount_gateway(&resolved)
+        self.is_mount_gateway(&self.diff_key(path).await)
     }
 
-    pub fn virtual_path_error() -> std::io::Error {
+    fn virtual_path_error() -> std::io::Error {
         std::io::Error::new(std::io::ErrorKind::PermissionDenied, VIRTUAL_PATH_MESSAGE)
     }
 
@@ -2595,7 +2586,7 @@ mod tests {
         }
     }
 
-    // Filesystem::is_mount_gateway / async_is_protected_path
+    // Filesystem
     #[test]
     fn mount_points_and_virtual_parents_cannot_be_removed_or_renamed() {
         crate::server::Server::with_mock(|server| async move {

@@ -419,7 +419,6 @@ nestify::nest! {
         #[schema(inline)]
         pub trash: Option<#[derive(ToSchema, Deserialize, Serialize, Clone, Copy)] pub struct ServerConfigurationTrash {
             pub retention: u64,
-            #[serde(default)]
             pub usage_threshold: Option<u64>,
         }>,
     }

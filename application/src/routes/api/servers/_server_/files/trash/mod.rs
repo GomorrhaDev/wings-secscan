@@ -240,15 +240,16 @@ mod delete {
     pub async fn route(server: GetServer, Query(data): Query<Params>) -> ApiResponseResult {
         let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
-        let entries: Vec<uuid::Uuid> = server
+        let entries = server
             .filesystem
             .trash
             .visible_entries(&server, &ignored)
-            .await
-            .into_iter()
-            .map(|entry| entry.uuid)
-            .collect();
-        let deleted = server.filesystem.trash.purge_many(&server, entries).await;
+            .await;
+        let deleted = server
+            .filesystem
+            .trash
+            .purge_many(&server, entries.into_iter().map(|entry| entry.uuid))
+            .await;
 
         ApiResponse::new_serialized(Response { deleted }).ok()
     }
