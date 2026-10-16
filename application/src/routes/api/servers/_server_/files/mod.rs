@@ -1,4 +1,10 @@
 use super::State;
+use crate::{
+    response::ApiResponse,
+    server::{Server, filesystem::VIRTUAL_PATH_MESSAGE},
+};
+use axum::http::StatusCode;
+use std::path::Path;
 use utoipa_axum::router::OpenApiRouter;
 
 mod chmod;
@@ -24,7 +30,18 @@ mod revisions;
 mod search;
 mod sqlite_query;
 mod stat;
+mod trash;
 mod write;
+
+async fn reject_protected(server: &Server, path: &Path) -> Result<(), ApiResponse> {
+    if server.filesystem.async_is_protected_path(path).await {
+        return Err(
+            ApiResponse::error(VIRTUAL_PATH_MESSAGE).with_status(StatusCode::EXPECTATION_FAILED)
+        );
+    }
+
+    Ok(())
+}
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
@@ -52,5 +69,6 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/decompress", decompress::router(state))
         .nest("/operations", operations::router(state))
         .nest("/revisions", revisions::router(state))
+        .nest("/trash", trash::router(state))
         .with_state(state.clone())
 }
