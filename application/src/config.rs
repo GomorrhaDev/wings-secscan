@@ -551,9 +551,6 @@ fn docker_numa_memory_binding() -> bool {
 fn docker_cpu_period() -> u64 {
     100000
 }
-fn docker_bandwidth_enabled() -> bool {
-    true
-}
 fn docker_cfs_burst_enabled() -> bool {
     true
 }
@@ -1251,8 +1248,12 @@ nestify::nest! {
             #[serde(default)]
             #[schema(inline)]
             pub bandwidth: #[derive(Clone, Copy, ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerBandwidth {
-                #[serde(default = "docker_bandwidth_enabled")]
-                pub enabled: bool,
+                #[serde(default)]
+                pub backend: crate::server::bandwidth::BandwidthBackendKind,
+                /// replaced by `backend`, only read to migrate older configs
+                #[serde(default, skip_serializing)]
+                #[schema(ignore)]
+                pub enabled: Option<bool>,
             },
 
             #[serde(default)]
@@ -1562,6 +1563,8 @@ type ReloadHandle =
 
 const LOG_CHANNEL_LINES: usize = 4096;
 const LEGACY_LIMITS_WARNING: &str = "migrated api.server_remote_download_limit to limits.server_concurrent_pulls, the old key is no longer used";
+const LEGACY_BANDWIDTH_WARNING: &str =
+    "migrated docker.bandwidth.enabled to docker.bandwidth.backend, the old key is no longer used";
 
 fn log_filter(debug: bool) -> Targets {
     let crate_level = if debug {
@@ -1626,6 +1629,7 @@ impl Config {
         #[cfg(unix)]
         let migrated_tmp_directory = Self::migrate_tmp_directory(&mut inner);
         let migrated_legacy_limits = Self::migrate_legacy_limits(&mut inner);
+        let migrated_legacy_bandwidth = Self::migrate_legacy_bandwidth(&mut inner);
         let (mut inner, env_overrides) = crate::env_overrides::apply_to_config(inner)?;
 
         Self::ensure_directories(&inner)?;
@@ -1699,6 +1703,9 @@ impl Config {
         if migrated_legacy_limits {
             tracing::warn!("{LEGACY_LIMITS_WARNING}");
         }
+        if migrated_legacy_bandwidth {
+            tracing::warn!("{LEGACY_BANDWIDTH_WARNING}");
+        }
 
         for applied in &env_overrides.applied {
             tracing::info!("applied environment override {applied}");
@@ -1752,6 +1759,9 @@ impl Config {
     pub fn replace(&self, mut new: InnerConfig) -> Result<(), anyhow::Error> {
         if Self::migrate_legacy_limits(&mut new) {
             tracing::warn!("{LEGACY_LIMITS_WARNING}");
+        }
+        if Self::migrate_legacy_bandwidth(&mut new) {
+            tracing::warn!("{LEGACY_BANDWIDTH_WARNING}");
         }
         let (new, _) = crate::env_overrides::apply_to_config(new)?;
         Self::validate_inner(&new)?;
@@ -2002,6 +2012,20 @@ impl Config {
             cfg.api.disable_remote_download = true;
         } else {
             cfg.limits.server_concurrent_pulls = limit;
+        }
+
+        true
+    }
+
+    /// Moves `docker.bandwidth.enabled` into `docker.bandwidth.backend`, where `false` became
+    /// the `disabled` backend and `true` is the `auto` default.
+    fn migrate_legacy_bandwidth(cfg: &mut InnerConfig) -> bool {
+        let Some(enabled) = cfg.docker.bandwidth.enabled.take() else {
+            return false;
+        };
+
+        if !enabled {
+            cfg.docker.bandwidth.backend = crate::server::bandwidth::BandwidthBackendKind::Disabled;
         }
 
         true

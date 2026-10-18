@@ -521,12 +521,17 @@ async fn main_rt() {
             crate::server::executor::docker::DockerExecutor::own_container(&docker).await;
         let firewall =
             crate::server::firewall::create(&config, &docker, own_container.as_ref()).await;
+        let bandwidth = Arc::new(
+            crate::server::bandwidth::Bandwidth::create(&config, &docker, own_container.as_ref())
+                .await,
+        );
 
         (
             Arc::new(crate::server::executor::docker::DockerExecutor::new(
                 Arc::clone(&docker),
                 config.clone(),
                 firewall,
+                bandwidth,
             )),
             docker,
         )
@@ -1073,6 +1078,11 @@ fn main() {
     if std::env::args_os().nth(1).as_deref() == Some(server::bandwidth::HELPER_ARG.as_ref()) {
         let args: Vec<_> = std::env::args_os().skip(2).collect();
         std::process::exit(server::bandwidth::helper_main(&args));
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().nth(1).as_deref() == Some(server::bandwidth::CONTAINER_ARG.as_ref()) {
+        let args: Vec<_> = std::env::args_os().skip(2).collect();
+        std::process::exit(server::bandwidth::container_main(&args));
     }
 
     let thread_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
