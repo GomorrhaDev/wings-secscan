@@ -19,6 +19,7 @@ mod decompress;
 mod delete;
 mod directory_sizes;
 mod fingerprints;
+mod ignore_matches;
 mod largest_directories;
 mod lines;
 mod list;
@@ -61,6 +62,7 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/directory-sizes", directory_sizes::router(state))
         .nest("/chmod", chmod::router(state))
         .nest("/search", search::router(state))
+        .nest("/ignore-matches", ignore_matches::router(state))
         .nest("/sqlite-query", sqlite_query::router(state))
         .nest("/stat", stat::router(state))
         .nest("/fingerprints", fingerprints::router(state))
