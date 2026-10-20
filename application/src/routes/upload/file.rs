@@ -142,6 +142,7 @@ mod post {
         },
     };
     use axum::{
+        body::Bytes,
         extract::{ConnectInfo, Multipart, Query},
         http::{HeaderMap, StatusCode},
     };
@@ -266,9 +267,8 @@ mod post {
             filesystem.async_create_dir_all(&root).await?;
 
             let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
-            let _lock_guard = lock.lock().await;
+            let lock_guard = lock.lock_owned().await;
 
-            let mut written_size = 0;
             let mut writer = filesystem.async_create_file(&part).await?;
 
             let guard = if filesystem.is_primary_server_fs() {
@@ -294,17 +294,35 @@ mod post {
                 None
             };
 
-            loop {
+            let (chunks, mut received) = tokio::sync::mpsc::channel::<Bytes>(4);
+            let append = tokio::spawn(async move {
+                let mut written = Ok(());
+                while let Some(chunk) = received.recv().await {
+                    if let Err(err) = writer.write_all(&chunk).await {
+                        written = Err(err);
+                        break;
+                    }
+                }
+
+                (written.and(writer.shutdown().await), lock_guard)
+            });
+
+            let mut written_size = 0;
+            let stopped: Option<ApiResponseResult> = loop {
                 let chunk = tokio::select! {
-                    chunk = field.chunk() => chunk?,
+                    chunk = field.chunk() => chunk,
                     _ = &mut locked => {
-                        return ApiResponse::error(super::LOCKED_ERROR)
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
+                        break Some(
+                            ApiResponse::error(super::LOCKED_ERROR)
+                                .with_status(StatusCode::EXPECTATION_FAILED)
+                                .ok(),
+                        );
                     }
                 };
-                let Some(chunk) = chunk else {
-                    break;
+                let chunk = match chunk {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break None,
+                    Err(err) => break Some(Err(err.into())),
                 };
 
                 let config = state.config.load();
@@ -312,24 +330,32 @@ mod post {
                     config.api.upload_limit.as_bytes() != 0
                         && written_size + chunk.len() as u64 > config.api.upload_limit.as_bytes(),
                 ) {
-                    return ApiResponse::error(&format!(
-                        "file size is larger than {}MiB",
-                        config.api.upload_limit.as_mib()
-                    ))
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
+                    break Some(
+                        ApiResponse::error(&format!(
+                            "file size is larger than {}MiB",
+                            config.api.upload_limit.as_mib()
+                        ))
+                        .with_status(StatusCode::EXPECTATION_FAILED)
+                        .ok(),
+                    );
                 }
                 drop(config);
 
-                writer.write_all(&chunk).await?;
                 written_size += chunk.len() as u64;
+                if chunks.send(chunk).await.is_err() {
+                    break None;
+                }
                 if let Some(guard) = &guard {
                     guard.set_progress(written_size);
                 }
-            }
+            };
 
-            writer.shutdown().await?;
-            drop(writer);
+            drop(chunks);
+            let (written, _lock_guard) = append.await?;
+            if let Some(result) = stopped {
+                return result;
+            }
+            written?;
 
             filesystem
                 .async_rename(&part, &path, FileType::File)
@@ -390,6 +416,9 @@ mod head {
             filesystem, part, ..
         } = super::resolve_target(&server, &payload, &params.directory, &params.file).await?;
 
+        let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
+        let _lock_guard = lock.lock().await;
+
         let offset = match filesystem.async_metadata(&part).await {
             Ok(metadata) => {
                 if !metadata.file_type.is_file() {
@@ -438,6 +467,13 @@ mod patch {
         file: compact_str::CompactString,
     }
 
+    enum AppendOutcome {
+        Written(u64),
+        Locked,
+        OverLimit,
+        Failed(std::io::Error),
+    }
+
     #[utoipa::path(patch, path = "/", responses(
         (status = OK),
         (status = UNAUTHORIZED, body = ApiError),
@@ -482,7 +518,6 @@ mod patch {
             .and_then(|value| value.parse::<u64>().ok());
 
         let locked = server.locked_signal();
-        tokio::pin!(locked);
 
         if super::issued_before_lock(&payload, &server) {
             return ApiResponse::error(super::LOCKED_ERROR)
@@ -525,7 +560,7 @@ mod patch {
         } = super::resolve_target(&server, &payload, &params.directory, &params.file).await?;
 
         let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
-        let _lock_guard = lock.lock().await;
+        let lock_guard = lock.lock_owned().await;
 
         filesystem.async_create_dir_all(&root).await?;
 
@@ -578,33 +613,62 @@ mod patch {
             None
         };
 
-        let mut written_size = disk_offset;
-        let mut stream = body.into_data_stream();
+        let (outcome, guard, _lock_guard) = tokio::spawn(async move {
+            tokio::pin!(locked);
 
-        loop {
-            let chunk = tokio::select! {
-                chunk = stream.next() => chunk,
-                _ = &mut locked => {
-                    file.shutdown().await?;
+            let mut written_size = disk_offset;
+            let mut stream = body.into_data_stream();
 
-                    return ApiResponse::error(super::LOCKED_ERROR)
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
+            let outcome = loop {
+                let chunk = tokio::select! {
+                    chunk = stream.next() => chunk,
+                    _ = &mut locked => break AppendOutcome::Locked,
+                };
+                let Some(chunk) = chunk else {
+                    break AppendOutcome::Written(written_size);
+                };
+
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(err) => {
+                        break AppendOutcome::Failed(std::io::Error::other(format!(
+                            "failed to read request body: {err}"
+                        )));
+                    }
+                };
+
+                if crate::unlikely(
+                    upload_limit != 0 && written_size + chunk.len() as u64 > upload_limit,
+                ) {
+                    break AppendOutcome::OverLimit;
+                }
+
+                if let Err(err) = file.write_all(&chunk).await {
+                    break AppendOutcome::Failed(err);
+                }
+                written_size += chunk.len() as u64;
+                if let Some(guard) = &guard {
+                    guard.set_progress(written_size);
                 }
             };
-            let Some(chunk) = chunk else {
-                break;
+
+            let outcome = match (outcome, file.shutdown().await) {
+                (AppendOutcome::Written(_), Err(err)) => AppendOutcome::Failed(err),
+                (outcome, _) => outcome,
             };
 
-            let chunk = chunk.map_err(|err| {
-                std::io::Error::other(format!("failed to read request body: {err}"))
-            })?;
+            (outcome, guard, lock_guard)
+        })
+        .await?;
 
-            if crate::unlikely(
-                upload_limit != 0 && written_size + chunk.len() as u64 > upload_limit,
-            ) {
-                file.shutdown().await?;
-
+        let written_size = match outcome {
+            AppendOutcome::Written(written_size) => written_size,
+            AppendOutcome::Locked => {
+                return ApiResponse::error(super::LOCKED_ERROR)
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            }
+            AppendOutcome::OverLimit => {
                 return ApiResponse::error(&format!(
                     "file size is larger than {}MiB",
                     state.config.load().api.upload_limit.as_mib()
@@ -612,16 +676,8 @@ mod patch {
                 .with_status(StatusCode::EXPECTATION_FAILED)
                 .ok();
             }
-
-            file.write_all(&chunk).await?;
-            written_size += chunk.len() as u64;
-            if let Some(guard) = &guard {
-                guard.set_progress(written_size);
-            }
-        }
-
-        file.shutdown().await?;
-        drop(file);
+            AppendOutcome::Failed(err) => return Err(err.into()),
+        };
 
         if upload_complete {
             if let Some(total_size) = upload_length
